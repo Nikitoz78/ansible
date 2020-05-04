@@ -1,0 +1,138 @@
+---
+- hosts: all
+  tasks:
+    - name: Install EPEL
+      package:
+        name: epel-release
+        state: present
+      when: ansible_distribution == "CentOS" or ansible_distribution=="RedHat"
+
+    - name: Install openvpn
+      become: yes
+      package:
+        name: "{{ item }}"
+        state: present
+      with_items:
+      - openvpn
+      - openssl
+      - easy-rsa
+
+    - name: Create openvpn key directory
+      file:
+        path: "{{ ansible_env.HOME }}"
+        state: directory
+
+    - name: Remove CA directory
+      become: yes
+      file:
+        state: absent
+        path: "{{ ansible_env.HOME }}/openvpn-ca/"
+
+    - name: Copy easy-rsa
+      become: yes
+      copy:
+        remote_src: yes
+        src: /usr/share/easy-rsa/3/
+        dest: "{{ ansible_env.HOME }}/openvpn-ca"
+
+    - name: Creat vars
+      become: yes
+      file:
+        path: "{{ ansible_env.HOME }}/openvpn-ca/vars"
+        state: touch
+
+    - name: Customize CA variable configuration
+      lineinfile:
+        dest: "{{ ansible_env.HOME }}/openvpn-ca/vars"
+        regexp: "^{{ item.property | regex_escape() }}="
+        line: "{{ item.property }}={{ item.value }}"
+      with_items:
+        - { property: 'export KEY_NAME', value: '"server"' }
+        - { property: 'export KEY_COUNTRY', value: '"RU"' }
+        - { property: 'export KEY_PROVINCE', value: '"52"' }
+        - { property: 'export KEY_CITY', value: '"NN"' }
+        - { property: 'export KEY_ORG', value: '"HOME"' }
+        - { property: 'export KEY_EMAIL', value: '"mail@mail.com"' }
+        - { property: 'export KEY_OU', value: '"HOME"' }
+        - { property: 'export KEY_CONFIG', value: '{{ ansible_env.HOME }}/openvpn-ca/openssl-1.0.0.cnf' }
+        - { property: 'export KEY_DIR', value: '{{ ansible_env.HOME }}/openvpn-ca/keys' }
+
+    - name: Build the certificate authority
+      become: yes
+      shell: >
+        source vars;
+        . ./vars;
+        ./easyrsa init-pki;
+        yes "" | ./easyrsa build-ca nopass;
+      args:
+        chdir: "{{ ansible_env.HOME }}/openvpn-ca/"
+        executable: /bin/bash
+
+    - name: Build Diffie-Hellman parameters !!! To proceed long time !!!
+      become: yes
+      shell: >
+        source vars;
+        ./easyrsa gen-dh;
+      args:
+        chdir: "{{ ansible_env.HOME }}/openvpn-ca/"
+        executable: /bin/bash
+
+    - name: Build key generation and server certificate
+      become: yes
+      shell: >
+        source vars;
+        yes "" |./easyrsa gen-req vpn-server nopass;
+        yes "yes" |./easyrsa sign-req server vpn-server;
+        openvpn --genkey --secret pki/ta.key;
+      args:
+        chdir: "{{ ansible_env.HOME }}/openvpn-ca/"
+        executable: /bin/bash
+
+    - name: Copy key and certificates to /etc/openvpn/server/
+      become: yes
+      copy:
+        remote_src: yes
+        src: "{{ item }}"
+        dest: /etc/openvpn/server/
+      with_items:
+        - "{{ ansible_env.HOME }}/openvpn-ca/pki/ca.crt"
+        - "{{ ansible_env.HOME }}/openvpn-ca/pki/ta.key"
+        - "{{ ansible_env.HOME }}/openvpn-ca/pki/dh.pem"
+        - "{{ ansible_env.HOME }}/openvpn-ca/pki/private/vpn-server.key"
+        - "{{ ansible_env.HOME }}/openvpn-ca/pki/issued/vpn-server.crt"
+
+    - name: Copy server.conf from sample config
+      become: yes
+      copy:
+        remote_src: yes
+        src: /usr/share/doc/openvpn/sample/sample-config-files/server.conf
+        dest: /etc/openvpn/server/
+
+    - name: Create log directory
+      file:
+        path: /var/log/openvpn/
+        state: directory
+
+    - name: Adjust OpenVPN server configuration
+      lineinfile:
+        dest: "/etc/openvpn/server/server.conf"
+        regexp: "^{{ item.regex | regex_escape() }}"
+        line: "{{ item.value }}"
+      with_items:
+        - { regex: ';user nobody', value: 'user nobody' }
+        - { regex: ';group nobody', value: 'group nobody' }
+        - { regex: 'cert server.crt', value: 'cert vpn-server.crt' }
+        - { regex: 'key server.key', value: 'key vpn-server.key' }
+        - { regex: 'dh dh2048.pem', value: 'dh dh.pem' }
+        - { regex: ';client-to-client', value: 'client-to-client' }
+        - { regex: 'status openvpn-status.log', value: 'status /var/log/openvpn/openvpn-status.log' }
+        - { regex: ';log         openvpn.log', value: 'log /var/log/openvpn/openvpn.log' }
+        - { regex: ';log-append  openvpn.log', value: 'log-append /var/log/openvpn/openvpn.log' }
+
+    - name: Start openvpn systemd service
+      become: true
+      systemd:
+        name: openvpn-server@server
+        state: started
+        daemon_reload: yes
+        enabled: yes
